@@ -298,6 +298,7 @@ private:
     bool roiAt(const Surface&, const Pane&, Point, unsigned& edges) const;
 
     bool target(Surface&);
+    void discardTarget(Surface&);
     void paint(Surface&);
     void fill(Surface&, Box, D2D1_COLOR_F, float radius = 0);
     void outline(Surface&, Box, D2D1_COLOR_F, float radius = 0, float width = 1);
@@ -306,7 +307,7 @@ private:
         DWRITE_TEXT_ALIGNMENT = DWRITE_TEXT_ALIGNMENT_LEADING, bool bold = false, bool wrap = false);
     void button(Surface&, Box, const std::wstring&, Command, int style = 0, size_t a = 0, size_t b = 0,
         std::wstring tip = {});
-    void bitmap(Surface&, const std::shared_ptr<Raster>&, Box, bool nearest, Orientation = {});
+    void bitmap(Surface&, const std::shared_ptr<Raster>&, Point top, double scale, bool nearest, Orientation = {});
     void fitBitmap(Surface&, const std::shared_ptr<Raster>&, Box);
     void drawBrowser(Surface&);
     void drawTree(Surface&, const std::vector<TreeNode>&, size_t level, size_t& row, Box clip);
@@ -690,6 +691,9 @@ void App::back() {
     ++measurementGeneration_;
     ++differenceGeneration_;
     comparing_ = false;
+    modal_ = Modal::None;
+    modalWindow_ = nullptr;
+    keyboardFocus_ = cHeld_ = sHeld_ = false;
     clearDrag();
     closeSecond();
     slots_.clear();
@@ -816,20 +820,39 @@ void App::updateDifference(bool recalculate) {
     }, true, true);
 }
 bool App::target(Surface& s) {
-    if (s.target) return true;
     RECT client{};
-    GetClientRect(s.hwnd, &client);
-    if (client.right <= 0 || client.bottom <= 0) return false;
+    if (!GetClientRect(s.hwnd, &client) || client.right <= 0 || client.bottom <= 0) return false;
+    const auto pixels = D2D1::SizeU(client.right, client.bottom);
+    if (const UINT dpi = GetDpiForWindow(s.hwnd)) s.dpi = dpi / 96.;
     const float dpi = float(s.dpi * 96);
+    if (s.target) {
+        // Direct2D stretches the back buffer when its pixel size differs from the client area.
+        const auto current = s.target->GetPixelSize();
+        if (current.width == pixels.width && current.height == pixels.height) {
+            s.target->SetDpi(dpi, dpi);
+            return true;
+        }
+        if (SUCCEEDED(s.target->Resize(pixels))) {
+            s.target->SetDpi(dpi, dpi);
+            return true;
+        }
+        discardTarget(s);
+    }
     const auto properties = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
         D2D1::PixelFormat(), dpi, dpi);
     if (FAILED(d2d_->CreateHwndRenderTarget(properties, D2D1::HwndRenderTargetProperties(s.hwnd,
-        D2D1::SizeU(client.right, client.bottom)), &s.target))) return false;
+        pixels), &s.target))) return false;
     if (FAILED(s.target->CreateSolidColorBrush(color.fg, &s.brush))) {
-        s.target.Reset();
+        discardTarget(s);
         return false;
     }
     return true;
+}
+
+void App::discardTarget(Surface& s) {
+    s.bitmaps.clear();
+    s.brush.Reset();
+    s.target.Reset();
 }
 
 void App::fill(Surface& s, Box b, D2D1_COLOR_F c, float radius) {
@@ -884,13 +907,13 @@ void App::button(Surface& s, Box b, const std::wstring& text, Command action, in
     s.hits.push_back({b, action, a, index, std::move(tip)});
 }
 
-void App::bitmap(Surface& s, const std::shared_ptr<Raster>& raster, Box b, bool nearest, Orientation o) {
-    if (!raster || b.width() <= 0 || b.height() <= 0) return;
-    const auto dim = o.size(raster->w, raster->h);
+void App::bitmap(Surface& s, const std::shared_ptr<Raster>& raster, Point top, double scale,
+    bool nearest, Orientation o) {
+    if (!raster || scale <= 0) return;
     const auto origin = o.offset(raster->w, raster->h);
-    const float sx = float(b.width() / dim.x), sy = float(b.height() / dim.y);
-    const auto transform = D2D1::Matrix3x2F(o.xx * sx, o.yx * sy, o.xy * sx, o.yy * sy,
-        float(b.l + origin.x * sx), float(b.t + origin.y * sy));
+    const auto zoom = float(scale);
+    const auto transform = D2D1::Matrix3x2F(o.xx * zoom, o.yx * zoom, o.xy * zoom, o.yy * zoom,
+        float(top.x + origin.x * scale), float(top.y + origin.y * scale));
     s.target->SetTransform(transform);
     const int edge = int((std::min)(4096u, s.target->GetMaximumBitmapSize()));
     const int columns = (raster->w + edge - 1) / edge;
@@ -919,7 +942,7 @@ void App::fitBitmap(Surface& s, const std::shared_ptr<Raster>& raster, Box area)
     const double scale = fit(area, raster->w, raster->h);
     const auto middle = area.center();
     const double w = raster->w * scale / 2, h = raster->h * scale / 2;
-    bitmap(s, raster, {middle.x - w, middle.y - h, middle.x + w, middle.y + h}, false);
+    bitmap(s, raster, {middle.x - w, middle.y - h}, scale, false);
 }
 
 void App::drawTree(Surface& s, const std::vector<TreeNode>& nodes, size_t level, size_t& row, Box clip) {
@@ -1144,11 +1167,10 @@ void App::drawPane(Surface& s, const Pane& pane) {
             shown.image ? color.pink : color.muted, DWRITE_TEXT_ALIGNMENT_CENTER);
     } else {
         const auto layout = view(s, pane, source);
-        const auto bottomRight = layout.screen({1, 1});
         const bool delta = diffOn_ && pane.slot == 1;
         const auto raster = delta ? diffRaster_ : shown.image->display;
         if (raster) {
-            bitmap(s, raster, {layout.top.x, layout.top.y, bottomRight.x, bottomRight.y}, true, shown.orientation);
+            bitmap(s, raster, layout.top, layout.scale, true, shown.orientation);
         } else {
             const bool failed = slots_[0].image && !slots_[0].image->display;
             label(s, failed ? L"左图加载失败，无法计算差值" : L"正在计算差值…",
@@ -1433,11 +1455,9 @@ void App::paint(Surface& s) {
         }
     } else if (context_) drawContext(s);
     else tooltip(s);
-    if (FAILED(s.target->EndDraw())) {
-        s.bitmaps.clear();
-        s.brush.Reset();
-        s.target.Reset();
-    }
+    const HRESULT result = s.target->EndDraw();
+    if (FAILED(result)) discardTarget(s);
+    if (result == D2DERR_RECREATE_TARGET) InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
 void App::setModal(Modal modal) {
@@ -1965,7 +1985,6 @@ LRESULT App::message(Surface& s, HWND hwnd, UINT message, WPARAM w, LPARAM l) {
     }
     case WM_DPICHANGED: {
         s.dpi = HIWORD(w) / 96.;
-        if (s.target) s.target->SetDpi(float(s.dpi * 96), float(s.dpi * 96));
         const auto& box = *reinterpret_cast<const RECT*>(l);
         SetWindowPos(hwnd, nullptr, box.left, box.top, box.right - box.left, box.bottom - box.top,
             SWP_NOZORDER | SWP_NOACTIVATE);
@@ -1973,14 +1992,7 @@ LRESULT App::message(Surface& s, HWND hwnd, UINT message, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_SIZE:
-        if (s.target && w != SIZE_MINIMIZED) {
-            if (FAILED(s.target->Resize(D2D1::SizeU(LOWORD(l), HIWORD(l))))) {
-                s.bitmaps.clear();
-                s.brush.Reset();
-                s.target.Reset();
-            }
-        }
-        InvalidateRect(hwnd, nullptr, FALSE);
+        if (w != SIZE_MINIMIZED) InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
@@ -2073,13 +2085,17 @@ LRESULT App::message(Surface& s, HWND hwnd, UINT message, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_CLOSE:
+        if (comparing_) {
+            const bool wasSecondary = s.secondary;
+            back();
+            if (wasSecondary) SetActiveWindow(main_.hwnd);
+            return 0;
+        }
         if (s.secondary) {
-            if (modalWindow_ == hwnd) setModal(Modal::None);
             closeSecond();
             return 0;
         }
         save();
-        back();
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
