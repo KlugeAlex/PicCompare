@@ -73,5 +73,6 @@ std::vector<float> difference(const Image& left, Orientation a, const Image& rig
 std::shared_ptr<Raster> differenceRaster(const Image& right,
     const std::vector<float>& values, double gain);
 int nativeValue(uint16_t sample, int bits);
+HRESULT saveScreenshotPng(IWICImagingFactory*, Raster&, const fs::path& folder, fs::path& saved);
 
 } // namespace pic

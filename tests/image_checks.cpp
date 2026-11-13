@@ -56,6 +56,25 @@ void checkInteraction() {
     require(close(restored.x, .08) && close(restored.y, -.04), "zoom round trip around same anchor");
 }
 
+void checkScreenshotPng(IWICImagingFactory* wic) {
+    Raster screenshot{2, 2, {0xff112233, 0xff445566, 0xff778899, 0xffaabbcc}};
+    const fs::path folder = L"build/fixtures";
+    fs::path first, second;
+    const auto firstResult = saveScreenshotPng(wic, screenshot, folder, first);
+    const auto secondResult = saveScreenshotPng(wic, screenshot, folder, second);
+    const auto decoded = decode(wic, first);
+    std::error_code error;
+    if (!first.empty()) fs::remove(first, error);
+    if (!second.empty()) fs::remove(second, error);
+    require(SUCCEEDED(firstResult) && SUCCEEDED(secondResult) && first != second,
+        "screenshots save to distinct PNG paths");
+    require(decoded->display && decoded->w == 2 && decoded->h == 2 &&
+        decoded->display->bgra == screenshot.bgra, "screenshot PNG pixel round trip");
+    fs::path failed;
+    require(FAILED(saveScreenshotPng(wic, screenshot, folder / L"rgb16.png", failed)) && failed.empty(),
+        "screenshot rejects a file as its output directory");
+}
+
 void checkLogic(IWICImagingFactory* wic) {
     const fs::path root = L"build/fixtures";
     const auto gray = decode(wic, root / L"gray16.png");
@@ -127,8 +146,9 @@ int main() {
         require(SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
             IID_PPV_ARGS(&wic))), "WIC initialization");
         checkLogic(wic.Get());
+        checkScreenshotPng(wic.Get());
         checkInteraction();
-        puts("PASS: native 16-bit decode, thumbnails, common formats, ROI statistics and editing, orientation, signed difference, pane-relative zoom.");
+        puts("PASS: native 16-bit decode, thumbnails, common formats, ROI, orientation, signed difference, zoom, screenshot PNG.");
     } catch (const std::exception& error) {
         fprintf(stderr, "FAIL: %s\n", error.what());
         result = 1;

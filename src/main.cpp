@@ -36,6 +36,7 @@ constexpr UINT_PTR reorderScrollTimer = 3;
 constexpr wchar_t windowClass[] = L"PicCompare.Desktop";
 constexpr wchar_t preferences[] = L"Software\\PicCompare";
 constexpr double toolbar = 64, header = 60, footer = 54, gutter = 46, rowHeight = 56;
+constexpr double compareBar = 49, compareFooter = 27;
 
 struct Palette {
     D2D1_COLOR_F bg{D2D1::ColorF(0x131923)}, panel{D2D1::ColorF(0x1b2432)},
@@ -80,10 +81,11 @@ struct Worker {
     std::mutex lock;
     std::condition_variable wake;
     bool done{};
+    bool finishPending{};
     std::deque<Job> foreground, background;
     std::thread thread;
 
-    Worker() : thread([this] {
+    explicit Worker(bool finish = false) : finishPending(finish), thread([this] {
         const HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         ComPtr<IWICImagingFactory> wic;
         CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
@@ -92,7 +94,7 @@ struct Worker {
             {
                 std::unique_lock guard(lock);
                 wake.wait(guard, [this] { return done || !foreground.empty() || !background.empty(); });
-                if (done) break;
+                if (done && (!finishPending || (foreground.empty() && background.empty()))) break;
                 auto& queue = foreground.empty() ? background : foreground;
                 job = std::move(queue.front());
                 queue.pop_front();
@@ -170,7 +172,7 @@ enum class Command {
     Add, SortName, SortTime, Order, Compare, Back, Previous, Next, Split, Help, ToggleTree,
     Refresh, ColumnSelect, ColumnClose, ColumnPath, RowSelect, FileSelect, TreeOpen, TreeToggle,
     TreeAdd, Remove, ConfirmDelete, Cancel, Range, RangePrev, RangeNext, RangeOpen, CopyPath,
-    Hist, Probe, Reset, Actual, Info, SplitMore, SplitFewer
+    Hist, Probe, Reset, Actual, Info, SplitMore, SplitFewer, ScreenshotFolder
 };
 struct Hit {
     Box box;
@@ -198,6 +200,8 @@ struct Surface {
     std::vector<Pane> panes;
     BrowserGrid grid;
     ComPtr<ID2D1HwndRenderTarget> target;
+    ComPtr<ID2D1RenderTarget> captureTarget;
+    ID2D1RenderTarget* renderer() const { return captureTarget ? captureTarget.Get() : target.Get(); }
     ComPtr<ID2D1SolidColorBrush> brush;
     struct Cached { std::weak_ptr<Raster> source; ComPtr<ID2D1Bitmap> bitmap; };
     std::unordered_map<const Raster*, std::vector<Cached>> bitmaps;
@@ -227,11 +231,13 @@ private:
     Surface main_, second_;
     ComPtr<ID2D1Factory> d2d_;
     ComPtr<IDWriteFactory> write_;
+    ComPtr<IWICImagingFactory> screenshotWic_;
     std::map<int, ComPtr<IDWriteTextFormat>> fonts_;
     std::vector<Column> columns_;
     std::vector<TreeNode> tree_;
     std::vector<fs::path> treePaths_;
     fs::path currentFolder_;
+    fs::path screenshotFolder_;
     std::set<fs::path> selection_;
     std::vector<std::pair<size_t, size_t>> pendingSelection_;
     std::vector<fs::path> pendingDelete_;
@@ -245,6 +251,7 @@ private:
     bool comparing_{}, split_{}, byTime_{}, descending_{}, treeVisible_{true};
     bool histogram_{true}, info_{true}, probeEnabled_{true}, cHeld_{}, sHeld_{}, diffOn_{};
     bool actual_{};
+    bool savingScreenshot_{};
     double zoom_{1}, gain_{1}, scrollY_{}, scrollX_{}, treeY_{};
     Point groupPan_, zoomShift_;
     size_t generation_{}, measurementGeneration_{}, rangeStart_{}, treeRows_{};
@@ -267,6 +274,7 @@ private:
     Worker differenceWorker_;
     Worker decodeWorker_;
     Worker thumbWorker_;
+    Worker screenshotWorker_{true};
 
     void invalidate();
     void post(std::function<void()>);
@@ -278,7 +286,10 @@ private:
     void scan(Column&);
     void sort(Column&);
     void refresh();
-    void pickFolder();
+    void pickFolder(bool screenshot = false, HWND owner = nullptr);
+    void setScreenshotFolder(const fs::path&);
+    void saveScreenshot(HWND owner);
+    HRESULT captureCanvas(const Surface&, Raster&);
     TreeNode* findTree(const fs::path&, std::vector<TreeNode>&);
     void expand(TreeNode&);
     void showInTree(const fs::path&);
@@ -328,6 +339,7 @@ private:
     void drawBrowser(Surface&);
     void drawTree(Surface&, const std::vector<TreeNode>&, size_t level, size_t& row, Box clip);
     void drawCompare(Surface&);
+    void drawCanvas(Surface&, Box);
     void drawPane(Surface&, const Pane&);
     void drawHistogram(Surface&, const Image&, Box);
     void drawModal(Surface&);
@@ -416,6 +428,12 @@ void App::save() {
 void App::restore() {
     if (!persist_) return;
     DWORD count{};
+    if (RegGetValueW(HKEY_CURRENT_USER, preferences, L"ScreenshotFolder", RRF_RT_REG_SZ,
+        nullptr, nullptr, &count) == ERROR_SUCCESS) {
+        std::wstring value(count / sizeof(wchar_t), L'\0');
+        if (RegGetValueW(HKEY_CURRENT_USER, preferences, L"ScreenshotFolder", RRF_RT_REG_SZ,
+            nullptr, value.data(), &count) == ERROR_SUCCESS) screenshotFolder_ = fs::path(value.c_str());
+    }
     if (RegGetValueW(HKEY_CURRENT_USER, preferences, L"LastFolder", RRF_RT_REG_SZ,
         nullptr, nullptr, &count) == ERROR_SUCCESS) {
         std::wstring value(count / sizeof(wchar_t), L'\0');
@@ -516,7 +534,22 @@ void App::refresh() {
     status(L"已重新载入文件夹。");
 }
 
-void App::pickFolder() {
+void App::setScreenshotFolder(const fs::path& folder) {
+    std::error_code ec;
+    if (!fs::is_directory(folder, ec)) {
+        status(L"请选择有效的截图保存目录。");
+        return;
+    }
+    screenshotFolder_ = folder;
+    if (persist_) {
+        const auto& path = screenshotFolder_.native();
+        RegSetKeyValueW(HKEY_CURRENT_USER, preferences, L"ScreenshotFolder", REG_SZ, path.c_str(),
+            DWORD((path.size() + 1) * sizeof(wchar_t)));
+    }
+    status(L"截图目录： " + screenshotFolder_.wstring());
+}
+
+void App::pickFolder(bool screenshot, HWND owner) {
     ComPtr<IFileOpenDialog> dialog;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
         IID_PPV_ARGS(&dialog)))) {
@@ -525,13 +558,16 @@ void App::pickFolder() {
     }
     FILEOPENDIALOGOPTIONS options{};
     dialog->GetOptions(&options);
-    dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_ALLOWMULTISELECT);
-    dialog->SetTitle(L"添加比较文件夹");
+    options |= FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST;
+    if (!screenshot) options |= FOS_ALLOWMULTISELECT;
+    dialog->SetOptions(options);
+    dialog->SetTitle(screenshot ? L"选择截图保存目录" : L"添加比较文件夹");
     ComPtr<IShellItem> initial;
-    if (!currentFolder_.empty() &&
-        SUCCEEDED(SHCreateItemFromParsingName(currentFolder_.c_str(), nullptr, IID_PPV_ARGS(&initial))))
+    const auto& folder = screenshot && !screenshotFolder_.empty() ? screenshotFolder_ : currentFolder_;
+    if (!folder.empty() &&
+        SUCCEEDED(SHCreateItemFromParsingName(folder.c_str(), nullptr, IID_PPV_ARGS(&initial))))
         dialog->SetFolder(initial.Get());
-    if (FAILED(dialog->Show(main_.hwnd))) return;
+    if (FAILED(dialog->Show(owner ? owner : main_.hwnd))) return;
     ComPtr<IShellItemArray> selected;
     if (FAILED(dialog->GetResults(&selected))) return;
     DWORD count{};
@@ -540,11 +576,12 @@ void App::pickFolder() {
         ComPtr<IShellItem> item;
         PWSTR path{};
         if (SUCCEEDED(selected->GetItemAt(i, &item)) && SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
-            addFolder(path);
+            if (screenshot) setScreenshotFolder(path);
+            else addFolder(path);
             CoTaskMemFree(path);
         }
     }
-    showInTree(currentFolder_);
+    if (!screenshot) showInTree(currentFolder_);
 }
 
 TreeNode* App::findTree(const fs::path& path, std::vector<TreeNode>& nodes) {
@@ -893,18 +930,18 @@ void App::discardTarget(Surface& s) {
 void App::fill(Surface& s, Box b, D2D1_COLOR_F c, float radius) {
     if (b.width() <= 0 || b.height() <= 0) return;
     s.brush->SetColor(c);
-    if (radius > 0) s.target->FillRoundedRectangle(D2D1::RoundedRect(rect(b), radius, radius), s.brush.Get());
-    else s.target->FillRectangle(rect(b), s.brush.Get());
+    if (radius > 0) s.renderer()->FillRoundedRectangle(D2D1::RoundedRect(rect(b), radius, radius), s.brush.Get());
+    else s.renderer()->FillRectangle(rect(b), s.brush.Get());
 }
 
 void App::outline(Surface& s, Box b, D2D1_COLOR_F c, float radius, float width) {
     s.brush->SetColor(c);
-    s.target->DrawRoundedRectangle(D2D1::RoundedRect(rect(b), radius, radius), s.brush.Get(), width);
+    s.renderer()->DrawRoundedRectangle(D2D1::RoundedRect(rect(b), radius, radius), s.brush.Get(), width);
 }
 
 void App::line(Surface& s, Point a, Point b, D2D1_COLOR_F c, float width) {
     s.brush->SetColor(c);
-    s.target->DrawLine(point(a), point(b), s.brush.Get(), width);
+    s.renderer()->DrawLine(point(a), point(b), s.brush.Get(), width);
 }
 
 void App::label(Surface& s, const std::wstring& text, Box box, int size, D2D1_COLOR_F ink,
@@ -931,12 +968,12 @@ void App::label(Surface& s, const std::wstring& text, Box box, int size, D2D1_CO
         const double offset = 1.25 / s.dpi;
         for (const auto& shift : {Point{-offset, 0}, Point{offset, 0}, Point{0, -offset}, Point{0, offset}}) {
             const Box edge{box.l + shift.x, box.t + shift.y, box.r + shift.x, box.b + shift.y};
-            s.target->DrawText(text.data(), UINT32(text.size()), format.Get(), rect(edge), s.brush.Get(),
+            s.renderer()->DrawText(text.data(), UINT32(text.size()), format.Get(), rect(edge), s.brush.Get(),
                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
     }
     s.brush->SetColor(ink);
-    s.target->DrawText(text.data(), UINT32(text.size()), format.Get(), rect(box), s.brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    s.renderer()->DrawText(text.data(), UINT32(text.size()), format.Get(), rect(box), s.brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 
 void App::button(Surface& s, Box b, const std::wstring& text, Command action, int style, size_t a,
@@ -958,8 +995,9 @@ void App::bitmap(Surface& s, const std::shared_ptr<Raster>& raster, Point top, d
     const auto zoom = float(scale);
     const auto transform = D2D1::Matrix3x2F(o.xx * zoom, o.yx * zoom, o.xy * zoom, o.yy * zoom,
         float(top.x + origin.x * scale), float(top.y + origin.y * scale));
-    s.target->SetTransform(transform);
-    const int edge = int((std::min)(4096u, s.target->GetMaximumBitmapSize()));
+    auto* render = s.renderer();
+    render->SetTransform(transform);
+    const int edge = int((std::min)(4096u, render->GetMaximumBitmapSize()));
     const int columns = (raster->w + edge - 1) / edge;
     const int rows = (raster->h + edge - 1) / edge;
     auto& tiles = s.bitmaps[raster.get()];
@@ -973,13 +1011,13 @@ void App::bitmap(Surface& s, const std::shared_ptr<Raster>& raster, Point top, d
             tile.source = raster;
             const auto properties = D2D1::BitmapProperties(
                 D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96, 96);
-            s.target->CreateBitmap(D2D1::SizeU(w, h), &raster->bgra[size_t(y) * raster->w + x],
+            render->CreateBitmap(D2D1::SizeU(w, h), &raster->bgra[size_t(y) * raster->w + x],
                 UINT32(raster->w * 4), properties, &tile.bitmap);
         }
-        if (tile.bitmap) s.target->DrawBitmap(tile.bitmap.Get(), D2D1::RectF(float(x), float(y), float(x + w), float(y + h)),
+        if (tile.bitmap) render->DrawBitmap(tile.bitmap.Get(), D2D1::RectF(float(x), float(y), float(x + w), float(y + h)),
             1, nearest ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
     }
-    s.target->SetTransform(D2D1::Matrix3x2F::Identity());
+    render->SetTransform(D2D1::Matrix3x2F::Identity());
 }
 
 void App::fitBitmap(Surface& s, const std::shared_ptr<Raster>& raster, Box area) {
@@ -1028,6 +1066,9 @@ void App::drawBrowser(Surface& s) {
     button(s, {413, 14, 487, 50}, L"修改时间", Command::SortTime, byTime_ && !hasManualOrder ? 1 : 0);
     button(s, {492, 14, 552, 50}, descending_ ? L"降序 ↓" : L"升序 ↑", Command::Order);
     button(s, {565, 14, 637, 50}, L"重新载入", Command::Refresh);
+    button(s, {647, 14, s.width - 99, 50}, screenshotFolder_.empty() ? L"截图目录…" :
+        L"截图目录 · " + screenshotFolder_.wstring(), Command::ScreenshotFolder, 0, 0, 0,
+        screenshotFolder_.empty() ? L"点击选择或拖入截图保存文件夹" : screenshotFolder_.wstring());
     button(s, {s.width - 91, 14, s.width - 16, 50}, L"快捷键 K", Command::Help);
 
     if (treeVisible_) {
@@ -1216,7 +1257,7 @@ void App::drawHistogram(Surface& s, const Image& image, Box b) {
 
 void App::drawPane(Surface& s, const Pane& pane) {
     const Box area = pane.area;
-    s.target->PushAxisAlignedClip(rect(area), D2D1_ANTIALIAS_MODE_ALIASED);
+    s.renderer()->PushAxisAlignedClip(rect(area), D2D1_ANTIALIAS_MODE_ALIASED);
     const size_t source = visibleSlot(pane.slot);
     const bool overlay = source != pane.slot;
     const auto& shown = slots_[source];
@@ -1321,7 +1362,7 @@ void App::drawPane(Surface& s, const Pane& pane) {
         label(s, title, {name.l + 6, name.t, name.r - 4, name.b}, 12,
             overlay || delta ? color.amber : color.fg, DWRITE_TEXT_ALIGNMENT_LEADING, false, false, true);
     }
-    s.target->PopAxisAlignedClip();
+    s.renderer()->PopAxisAlignedClip();
     const double x = std::floor(area.r * s.dpi) / s.dpi - .5 / s.dpi;
     const double y = std::floor(area.b * s.dpi) / s.dpi - .5 / s.dpi;
     line(s, {x, area.t}, {x, area.b}, color.line, float(1 / s.dpi));
@@ -1329,7 +1370,7 @@ void App::drawPane(Surface& s, const Pane& pane) {
 }
 
 void App::drawCompare(Surface& s) {
-    const double bar = 49, bottom = s.height - 27;
+    const double bar = compareBar, bottom = s.height - compareFooter;
     fill(s, {0, 0, s.width, bar}, color.panel);
     button(s, {12, 8, 93, 41}, L"‹ 浏览", Command::Back);
     button(s, {105, 8, 186, 41}, L"上一组 B", Command::Previous);
@@ -1344,26 +1385,126 @@ void App::drawCompare(Surface& s) {
     }
     button(s, {s.width - 171, 8, s.width - 97, 41}, split_ ? L"合并屏幕" : L"双屏 F", Command::Split);
     button(s, {s.width - 89, 8, s.width - 12, 41}, L"快捷键 K", Command::Help);
-    fill(s, {0, bar, s.width, bottom}, color.canvas);
+    drawCanvas(s, {0, bar, s.width, bottom});
+    fill(s, {0, bottom, s.width, s.height}, color.panel);
+    std::wstring text = status_.empty() ? L"S 框选 ROI   ·   Shift 拖框   ·   Ctrl + Shift 单图拖框   ·   Ctrl + C 截图" : status_;
+    if (status_.empty() && diffOn_) text = L"右侧滚轮调差值增益   ·   Shift + 滚轮缩放   ·   D 退出差值   ·   Ctrl + C 截图";
+    label(s, text, {12, bottom, s.width - 110, s.height}, 11, status_.empty() ? color.muted : color.amber);
+    label(s, std::to_wstring(slots_.size()) + L" 张图" + (split_ ? (s.secondary ? L" · 第二屏" : L" · 第一屏") : L""),
+        {s.width - 121, bottom, s.width - 13, s.height}, 11, color.muted, DWRITE_TEXT_ALIGNMENT_TRAILING);
+}
+
+void App::drawCanvas(Surface& s, Box canvas) {
+    fill(s, canvas, color.canvas);
     const size_t boundary = split_ ? splitBoundary_ : slots_.size();
     const size_t begin = s.secondary ? boundary : 0, end = s.secondary ? slots_.size() : boundary;
     const size_t count = end - begin;
     if (count) {
         const size_t cols = count <= 3 ? count : (count + 1) / 2;
         const size_t rows = count <= 3 ? 1 : 2;
-        const double w = s.width / cols, h = (bottom - bar) / rows;
+        const double w = canvas.width() / cols, h = canvas.height() / rows;
         for (size_t i = 0; i < count; ++i) {
-            const double x = (i % cols) * w, y = bar + (i / cols) * h;
+            const double x = canvas.l + (i % cols) * w, y = canvas.t + (i / cols) * h;
             s.panes.push_back({begin + i, {x, y, x + w, y + h}});
             drawPane(s, s.panes.back());
         }
     }
-    fill(s, {0, bottom, s.width, s.height}, color.panel);
-    std::wstring text = status_.empty() ? L"S 框选 ROI   ·   Shift 拖框   ·   Ctrl + Shift 单图拖框" : status_;
-    if (status_.empty() && diffOn_) text = L"右侧滚轮调差值增益   ·   Shift + 滚轮缩放   ·   D 退出差值";
-    label(s, text, {12, bottom, s.width - 110, s.height}, 11, status_.empty() ? color.muted : color.amber);
-    label(s, std::to_wstring(slots_.size()) + L" 张图" + (split_ ? (s.secondary ? L" · 第二屏" : L" · 第一屏") : L""),
-        {s.width - 121, bottom, s.width - 13, s.height}, 11, color.muted, DWRITE_TEXT_ALIGNMENT_TRAILING);
+}
+
+HRESULT App::captureCanvas(const Surface& window, Raster& raster) {
+    RECT client{};
+    if (!GetClientRect(window.hwnd, &client) || client.right <= 0) return E_FAIL;
+    Surface shot;
+    shot.secondary = window.secondary;
+    const auto windowDpi = GetDpiForWindow(window.hwnd);
+    shot.dpi = windowDpi ? windowDpi / 96. : window.dpi;
+    const auto topPixel = std::lround(compareBar * shot.dpi);
+    const double bottom = client.bottom / shot.dpi - compareFooter;
+    const int height = int(std::lround(bottom * shot.dpi) - topPixel);
+    if (height <= 0 || uint64_t(client.right) * height > 100000000) return E_INVALIDARG;
+    if (!screenshotWic_) {
+        const auto result = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&screenshotWic_));
+        if (FAILED(result)) return result;
+    }
+    ComPtr<IWICBitmap> canvas;
+    HRESULT hr = screenshotWic_->CreateBitmap(client.right, height, GUID_WICPixelFormat32bppPBGRA,
+        WICBitmapCacheOnLoad, &canvas);
+    if (FAILED(hr)) return hr;
+    const float dpi = float(shot.dpi * 96);
+    const auto options = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi);
+    if (FAILED(hr = d2d_->CreateWicBitmapRenderTarget(canvas.Get(), options, &shot.captureTarget))) return hr;
+    auto* render = shot.renderer();
+    if (FAILED(hr = render->CreateSolidColorBrush(color.fg, &shot.brush))) return hr;
+    render->BeginDraw();
+    render->Clear(color.canvas);
+    render->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    const double crop = topPixel / shot.dpi;
+    drawCanvas(shot, {0, compareBar - crop, client.right / shot.dpi, bottom - crop});
+    if (FAILED(hr = render->EndDraw())) return hr;
+    raster.w = client.right;
+    raster.h = height;
+    raster.bgra.resize(size_t(raster.w) * raster.h);
+    return canvas->CopyPixels(nullptr, raster.w * 4, UINT(raster.bgra.size() * 4),
+        reinterpret_cast<BYTE*>(raster.bgra.data()));
+}
+
+void App::saveScreenshot(HWND owner) {
+    if (savingScreenshot_) {
+        status(L"正在保存上一张截图。");
+        return;
+    }
+    std::error_code ec;
+    if (!fs::is_directory(screenshotFolder_, ec)) pickFolder(true, owner);
+    ec.clear();
+    if (!comparing_ || !fs::is_directory(screenshotFolder_, ec)) return;
+    Raster raster;
+    try {
+        if (FAILED(captureCanvas(main_, raster))) {
+            status(L"无法截取当前对比画面。");
+            return;
+        }
+        if (split_) {
+            Raster second;
+            if (FAILED(captureCanvas(second_, second))) {
+                status(L"无法截取第二屏的对比画面。");
+                return;
+            }
+            Raster joined;
+            joined.w = raster.w + second.w;
+            joined.h = (std::max)(raster.h, second.h);
+            if (uint64_t(joined.w) * joined.h > 100000000) {
+                status(L"双屏截图尺寸过大，请缩小窗口后重试。");
+                return;
+            }
+            joined.bgra.resize(size_t(joined.w) * joined.h, 0xff15171a);
+            int x{};
+            for (const auto* screen : {&raster, &second}) {
+                for (int y = 0; y < screen->h; ++y)
+                    std::copy_n(screen->bgra.data() + size_t(y) * screen->w, screen->w,
+                        joined.bgra.data() + size_t(y) * joined.w + x);
+                x += screen->w;
+            }
+            raster = std::move(joined);
+        }
+        savingScreenshot_ = true;
+        screenshotWorker_.push([this, folder = screenshotFolder_, raster = std::move(raster)](IWICImagingFactory* wic) mutable {
+            fs::path saved;
+            HRESULT hr = E_OUTOFMEMORY;
+            try { hr = saveScreenshotPng(wic, raster, folder, saved); }
+            catch (const std::bad_alloc&) {}
+            post([this, hr, saved = std::move(saved)] {
+                savingScreenshot_ = false;
+                if (SUCCEEDED(hr)) status(L"截图已保存： " + saved.wstring());
+                else status(L"无法保存截图，请检查截图目录的写入权限和可用空间。");
+            });
+        }, true);
+        status(L"正在保存截图…");
+    } catch (const std::bad_alloc&) {
+        savingScreenshot_ = false;
+        status(L"内存不足，无法截取当前画面。");
+    }
 }
 
 void App::drawModal(Surface& s) {
@@ -1397,7 +1538,8 @@ void App::drawModal(Surface& s) {
             {L"Shift + 左键拖框", L"框内移动 / 边角调整大小"},
             {L"ROI 右键", L"删除该 ROI"},
             {L"O / I / U", L"旋转 90° / 镜像 / 翻转"},
-            {L"Ctrl + O / I / U", L"变换当前窗格"}
+            {L"Ctrl + O / I / U", L"变换当前窗格"},
+            {L"Ctrl + C", L"保存当前对比画面为 PNG"}
         };
         const std::pair<const wchar_t*, const wchar_t*> right[]{
             {L"Ctrl + Shift + 左键拖框", L"只调整当前图的 ROI"},
@@ -1587,6 +1729,7 @@ void App::command(const Hit& hit, bool ctrl) {
     context_.reset();
     switch (action) {
     case Command::Add: pickFolder(); break;
+    case Command::ScreenshotFolder: pickFolder(true); break;
     case Command::SortName:
     case Command::SortTime:
     case Command::Order:
@@ -1943,8 +2086,10 @@ void App::endPointer(Surface& s, Point p) {
         const auto delta = p - drag_.start;
         clearDrag();
         if (std::hypot(delta.x, delta.y) > 6) {
-            for (const auto& hit : s.hits) if (hit.action == Command::Add && hit.box.contains(p)) {
-                addFolder(folder);
+            for (const auto& hit : s.hits) if (hit.box.contains(p) &&
+                (hit.action == Command::Add || hit.action == Command::ScreenshotFolder)) {
+                if (hit.action == Command::ScreenshotFolder) setScreenshotFolder(folder);
+                else addFolder(folder);
                 break;
             }
         }
@@ -2062,7 +2207,8 @@ void App::key(Surface& s, WPARAM code, LPARAM modifiers, bool down) {
     case L'F': action(Command::Split); break;
     case L'S': sHeld_ = true; break;
     case L'C':
-        if (slots_.size() == 2) {
+        if (held(VK_CONTROL)) saveScreenshot(s.hwnd);
+        else if (slots_.size() == 2) {
             cHeld_ = true;
             invalidate();
         }
@@ -2225,6 +2371,12 @@ LRESULT App::message(Surface& s, HWND hwnd, UINT message, WPARAM w, LPARAM l) {
     case WM_DROPFILES: {
         auto drop = reinterpret_cast<HDROP>(w);
         if (!comparing_ && modal_ == Modal::None && !drag_.reorder) {
+            POINT client{};
+            const bool inside = DragQueryPoint(drop, &client);
+            const Point p{client.x / s.dpi, client.y / s.dpi};
+            const bool forScreenshot = inside && std::any_of(s.hits.begin(), s.hits.end(), [&](const Hit& hit) {
+                return hit.action == Command::ScreenshotFolder && hit.box.contains(p);
+            });
             UINT added{};
             const UINT count = DragQueryFileW(drop, 0xffffffff, nullptr, 0);
             for (UINT i = 0; i < count; ++i) {
@@ -2232,10 +2384,17 @@ LRESULT App::message(Surface& s, HWND hwnd, UINT message, WPARAM w, LPARAM l) {
                 if (!DragQueryFileW(drop, i, path.data(), UINT(path.size()))) continue;
                 fs::path folder(path.c_str());
                 std::error_code ec;
-                if (fs::is_directory(folder, ec)) { addFolder(folder); ++added; }
+                if (!fs::is_directory(folder, ec)) continue;
+                if (forScreenshot) {
+                    setScreenshotFolder(folder);
+                    ++added;
+                    break;
+                }
+                addFolder(folder);
+                ++added;
             }
-            if (added) showInTree(currentFolder_);
-            else status(L"请拖入存放图片的文件夹。");
+            if (added && !forScreenshot) showInTree(currentFolder_);
+            if (!added) status(L"请拖入文件夹。");
         }
         DragFinish(drop);
         return 0;

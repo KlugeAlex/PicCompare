@@ -1,6 +1,7 @@
 #include "image.h"
 
 #include <wrl/client.h>
+#include <shlwapi.h>
 #include <webp/decode.h>
 #include <webp/demux.h>
 #include <algorithm>
@@ -438,6 +439,60 @@ std::shared_ptr<Raster> differenceRaster(const Image& right,
         raster->bgra[i] = 0xff000000u | v * 0x010101u;
     }
     return raster;
+}
+
+static HRESULT encodeScreenshot(IWICImagingFactory* wic, Raster& raster, const fs::path& path) {
+    if (!wic) return E_NOINTERFACE;
+    ComPtr<IStream> stream;
+    HRESULT hr = SHCreateStreamOnFileEx(path.c_str(), STGM_WRITE | STGM_SHARE_EXCLUSIVE,
+        FILE_ATTRIBUTE_NORMAL, TRUE, nullptr, &stream);
+    if (FAILED(hr)) return hr;
+    ComPtr<IWICBitmapEncoder> encoder;
+    if (FAILED(hr = wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder))) return hr;
+    if (FAILED(hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache))) return hr;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    if (FAILED(hr = encoder->CreateNewFrame(&frame, nullptr))) return hr;
+    if (FAILED(hr = frame->Initialize(nullptr))) return hr;
+    if (FAILED(hr = frame->SetSize(raster.w, raster.h))) return hr;
+    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+    if (FAILED(hr = frame->SetPixelFormat(&format))) return hr;
+    if (format != GUID_WICPixelFormat32bppBGRA) return WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT;
+    auto* pixels = reinterpret_cast<BYTE*>(raster.bgra.data());
+    if (FAILED(hr = frame->WritePixels(raster.h, raster.w * 4, UINT(raster.bgra.size() * 4), pixels))) return hr;
+    if (FAILED(hr = frame->Commit())) return hr;
+    if (FAILED(hr = encoder->Commit())) return hr;
+    return stream->Commit(STGC_DEFAULT);
+}
+
+HRESULT saveScreenshotPng(IWICImagingFactory* wic, Raster& raster, const fs::path& folder, fs::path& saved) {
+    if (raster.w <= 0 || raster.h <= 0 || raster.bgra.size() != size_t(raster.w) * raster.h ||
+        raster.bgra.size() > (std::numeric_limits<UINT>::max)() / 4) return E_INVALIDARG;
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    wchar_t stamp[48]{};
+    swprintf_s(stamp, L"PicCompare_%04u%02u%02u_%02u%02u%02u_%03u",
+        unsigned(now.wYear), unsigned(now.wMonth), unsigned(now.wDay),
+        unsigned(now.wHour), unsigned(now.wMinute), unsigned(now.wSecond), unsigned(now.wMilliseconds));
+    GUID id{};
+    if (const HRESULT hr = CoCreateGuid(&id); FAILED(hr)) return hr;
+    wchar_t name[40]{};
+    StringFromGUID2(id, name, int(std::size(name)));
+    const auto temp = folder / (std::wstring(L".PicCompare-") + name + L".tmp");
+    HRESULT result = encodeScreenshot(wic, raster, temp);
+    if (SUCCEEDED(result)) {
+        for (unsigned attempt = 0; attempt < 100; ++attempt) {
+            std::wstring filename = stamp;
+            if (attempt) filename += L"_" + std::to_wstring(attempt);
+            saved = folder / (filename + L".png");
+            if (MoveFileExW(temp.c_str(), saved.c_str(), MOVEFILE_WRITE_THROUGH)) return S_OK;
+            const auto error = GetLastError();
+            result = HRESULT_FROM_WIN32(error);
+            if (error != ERROR_ALREADY_EXISTS && error != ERROR_FILE_EXISTS) break;
+        }
+    }
+    DeleteFileW(temp.c_str());
+    saved.clear();
+    return result;
 }
 
 } // namespace pic

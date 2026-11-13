@@ -11,7 +11,7 @@ if errorlevel 1 exit /b 1
 python tests\make_fixtures.py
 if errorlevel 1 exit /b 1
 set "WEBP=%CD%\build\libwebp-1.6.0-windows-x64"
-cl /nologo /std:c++20 /EHsc /W4 /WX /utf-8 /O2 /MT /DNOMINMAX /DWIN32_LEAN_AND_MEAN /I"%WEBP%\include" /Fo:build\ /Fe:build\image_checks.exe tests\image_checks.cpp src\image.cpp /link /LIBPATH:"%WEBP%\lib" libwebp.lib libwebpdemux.lib windowscodecs.lib ole32.lib oleaut32.lib uuid.lib
+cl /nologo /std:c++20 /EHsc /W4 /WX /utf-8 /O2 /MT /DNOMINMAX /DWIN32_LEAN_AND_MEAN /I"%WEBP%\include" /Fo:build\ /Fe:build\image_checks.exe tests\image_checks.cpp src\image.cpp /link /LIBPATH:"%WEBP%\lib" libwebp.lib libwebpdemux.lib windowscodecs.lib ole32.lib oleaut32.lib uuid.lib shlwapi.lib
 if errorlevel 1 exit /b 1
 build\image_checks.exe
 exit /b %errorlevel%
