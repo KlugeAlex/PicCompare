@@ -4,7 +4,7 @@ PicCompare 是用 C++ 编写的 Windows 桌面图像比对工具，支持同时�
 
 ## 下载与快速开始
 
-1. 在 [GitHub Releases](../../releases/latest) 下载 `PicCompare-Windows-x64.zip`。解压后双击 `PicCompare.exe`，适用于 Windows 10 / 11 x64，无需安装。
+1. 在 [GitHub Releases](https://github.com/KlugeAlex/PicCompare/releases/latest) 下载 `PicCompare-Windows-x64.zip`。解压后双击 `PicCompare.exe`，适用于 Windows 10 / 11 x64，无需安装。
 2. 点击 **＋ 添加文件夹**，或从资源管理器拖入文件夹。也可在左侧目录树里双击文件夹，或将它拖到加号上。
 3. 选中 1–8 张图片，按 **空格**或点击 **对比**。对比页按 **K** 打开快捷键面板。
 
