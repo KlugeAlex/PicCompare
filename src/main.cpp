@@ -32,6 +32,7 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 constexpr UINT workReady = WM_APP + 1;
+constexpr UINT_PTR reorderScrollTimer = 3;
 constexpr wchar_t windowClass[] = L"PicCompare.Desktop";
 constexpr wchar_t preferences[] = L"Software\\PicCompare";
 constexpr double toolbar = 64, header = 60, footer = 54, gutter = 46, rowHeight = 56;
@@ -43,7 +44,7 @@ struct Palette {
         blue{D2D1::ColorF(0x8ab9ff)}, primary{D2D1::ColorF(0x2b66c1)},
         selected{D2D1::ColorF(0x253b59)}, canvas{D2D1::ColorF(0x15171a)},
         danger{D2D1::ColorF(0x9c3344)}, pink{D2D1::ColorF(0xffa5af)},
-        amber{D2D1::ColorF(0xffcc76)}, overlay{D2D1::ColorF(0x10151d, .86f)};
+        amber{D2D1::ColorF(0xffcc76)};
 } const color;
 
 D2D1_RECT_F rect(Box b) {
@@ -134,6 +135,7 @@ struct Column {
     std::vector<Entry> files;
     std::set<fs::path> hidden;
     std::wstring error;
+    bool manualOrder{};
 };
 struct TreeNode {
     fs::path path;
@@ -177,7 +179,15 @@ struct Hit {
     std::wstring tip;
 };
 enum class Modal { None, Help, Delete, Permanent, TooMany, Range };
-enum class Gesture { None, Group, Single, NewRoi, EditRoi, TreeDrag };
+enum class Gesture { None, Group, Single, NewRoi, EditRoi, TreeDrag, ColumnDrag, FileDrag };
+struct BrowserGrid {
+    Box area;
+    double bodyTop{}, columnWidth{};
+};
+struct ReorderDrop {
+    size_t boundary{};
+    Box indicator;
+};
 struct Surface {
     HWND hwnd{};
     bool secondary{};
@@ -186,6 +196,7 @@ struct Surface {
     Point mouse{-1, -1};
     std::vector<Hit> hits;
     std::vector<Pane> panes;
+    BrowserGrid grid;
     ComPtr<ID2D1HwndRenderTarget> target;
     ComPtr<ID2D1SolidColorBrush> brush;
     struct Cached { std::weak_ptr<Raster> source; ComPtr<ID2D1Bitmap> bitmap; };
@@ -199,6 +210,8 @@ struct Drag {
     bool singleRoi{};
     Point start, previous;
     fs::path folder;
+    std::optional<Hit> reorder;
+    bool ctrl{}, moved{};
 };
 
 class App {
@@ -228,6 +241,7 @@ private:
     std::optional<Point> probe_;
     size_t hotSlot_{}, splitBoundary_{};
     Drag drag_;
+    std::optional<WINDOWPLACEMENT> mainBeforeSplit_;
     bool comparing_{}, split_{}, byTime_{}, descending_{}, treeVisible_{true};
     bool histogram_{true}, info_{true}, probeEnabled_{true}, cHeld_{}, sHeld_{}, diffOn_{};
     bool actual_{};
@@ -291,6 +305,7 @@ private:
     void endPointer(Surface&, Point);
     void wheel(Surface&, Point, double, bool horizontal);
     void clearDrag();
+    std::optional<ReorderDrop> reorderDrop(const Surface&, Point) const;
     std::optional<Pane> paneAt(Surface&, Point) const;
     View view(const Surface&, const Pane&, size_t imageSlot) const;
     size_t visibleSlot(size_t paneSlot) const;
@@ -304,7 +319,8 @@ private:
     void outline(Surface&, Box, D2D1_COLOR_F, float radius = 0, float width = 1);
     void line(Surface&, Point, Point, D2D1_COLOR_F, float width = 1);
     void label(Surface&, const std::wstring&, Box, int size = 14, D2D1_COLOR_F = color.fg,
-        DWRITE_TEXT_ALIGNMENT = DWRITE_TEXT_ALIGNMENT_LEADING, bool bold = false, bool wrap = false);
+        DWRITE_TEXT_ALIGNMENT = DWRITE_TEXT_ALIGNMENT_LEADING, bool bold = false, bool wrap = false,
+        bool shadow = false);
     void button(Surface&, Box, const std::wstring&, Command, int style = 0, size_t a = 0, size_t b = 0,
         std::wstring tip = {});
     void bitmap(Surface&, const std::shared_ptr<Raster>&, Point top, double scale, bool nearest, Orientation = {});
@@ -480,8 +496,20 @@ void App::refresh() {
     const auto previous = selection_;
     selection_.clear();
     for (auto& col : columns_) {
+        std::unordered_map<fs::path, size_t> previousOrder;
+        if (col.manualOrder)
+            for (size_t row = 0; row < col.files.size(); ++row) previousOrder.emplace(col.files[row].path, row);
         col.hidden.clear();
         scan(col);
+        if (!previousOrder.empty()) {
+            const auto rank = [&](const Entry& entry) {
+                const auto found = previousOrder.find(entry.path);
+                return found == previousOrder.end() ? previousOrder.size() : found->second;
+            };
+            std::stable_sort(col.files.begin(), col.files.end(), [&](const Entry& a, const Entry& b) {
+                return rank(a) < rank(b);
+            });
+        }
         for (const auto& entry : col.files)
             if (previous.contains(entry.path)) selection_.insert(entry.path);
     }
@@ -722,6 +750,10 @@ void App::closeSecond() {
     split_ = false;
     if (second_.hwnd) DestroyWindow(second_.hwnd);
     second_ = {};
+    if (mainBeforeSplit_) {
+        SetWindowPlacement(main_.hwnd, &*mainBeforeSplit_);
+        mainBeforeSplit_.reset();
+    }
     invalidate();
 }
 
@@ -759,6 +791,9 @@ void App::split() {
     second_.dpi = (std::max)(96u, GetDpiForWindow(second_.hwnd)) / 96.;
     split_ = true;
     splitBoundary_ = (slots_.size() + 1) / 2;
+    WINDOWPLACEMENT placement{sizeof(placement)};
+    if (GetWindowPlacement(main_.hwnd, &placement)) mainBeforeSplit_ = placement;
+    ShowWindow(main_.hwnd, SW_MAXIMIZE);
     ShowWindow(second_.hwnd, SW_MAXIMIZE);
     invalidate();
 }
@@ -873,7 +908,7 @@ void App::line(Surface& s, Point a, Point b, D2D1_COLOR_F c, float width) {
 }
 
 void App::label(Surface& s, const std::wstring& text, Box box, int size, D2D1_COLOR_F ink,
-    DWRITE_TEXT_ALIGNMENT alignment, bool bold, bool wrap) {
+    DWRITE_TEXT_ALIGNMENT alignment, bool bold, bool wrap, bool shadow) {
     if (box.width() <= 0 || box.height() <= 0 || text.empty()) return;
     const int id = size * 16 + int(alignment) * 4 + (bold ? 2 : 0) + (wrap ? 1 : 0);
     auto& format = fonts_[id];
@@ -889,6 +924,15 @@ void App::label(Surface& s, const std::wstring& text, Box box, int size, D2D1_CO
             ComPtr<IDWriteInlineObject> ellipsis;
             if (SUCCEEDED(write_->CreateEllipsisTrimmingSign(format.Get(), &ellipsis)))
                 format->SetTrimming(&trim, ellipsis.Get());
+        }
+    }
+    if (shadow) {
+        s.brush->SetColor(D2D1::ColorF(0x080a0e, .95f));
+        const double offset = 1.25 / s.dpi;
+        for (const auto& shift : {Point{-offset, 0}, Point{offset, 0}, Point{0, -offset}, Point{0, offset}}) {
+            const Box edge{box.l + shift.x, box.t + shift.y, box.r + shift.x, box.b + shift.y};
+            s.target->DrawText(text.data(), UINT32(text.size()), format.Get(), rect(edge), s.brush.Get(),
+                D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
     }
     s.brush->SetColor(ink);
@@ -977,8 +1021,11 @@ void App::drawBrowser(Surface& s) {
     line(s, {31.5, 25}, {31.5, 38}, color.fg, 1.4f);
     label(s, L"PicCompare", {57, 10, 180, 53}, 20, color.fg, DWRITE_TEXT_ALIGNMENT_LEADING, true);
     button(s, {185, 14, 320, 50}, L"＋ 添加文件夹", Command::Add, 1, 0, 0, L"点击选择文件夹，也可把文件夹拖到这里");
-    button(s, {332, 14, 408, 50}, L"文件名", Command::SortName, byTime_ ? 0 : 1);
-    button(s, {413, 14, 487, 50}, L"修改时间", Command::SortTime, byTime_ ? 1 : 0);
+    const bool hasManualOrder = std::any_of(columns_.begin(), columns_.end(), [](const Column& col) {
+        return col.manualOrder;
+    });
+    button(s, {332, 14, 408, 50}, L"文件名", Command::SortName, !byTime_ && !hasManualOrder ? 1 : 0);
+    button(s, {413, 14, 487, 50}, L"修改时间", Command::SortTime, byTime_ && !hasManualOrder ? 1 : 0);
     button(s, {492, 14, 552, 50}, descending_ ? L"降序 ↓" : L"升序 ↑", Command::Order);
     button(s, {565, 14, 637, 50}, L"重新载入", Command::Refresh);
     button(s, {s.width - 91, 14, s.width - 16, 50}, L"快捷键 K", Command::Help);
@@ -1025,17 +1072,27 @@ void App::drawBrowser(Surface& s) {
         label(s, L"行", {side, toolbar, beginX, beginY}, 13, color.muted, DWRITE_TEXT_ALIGNMENT_CENTER);
         line(s, {side, beginY - .5}, {s.width, beginY - .5}, color.line);
         const Box grid{beginX, toolbar, s.width - 7, rowBottom};
+        s.grid = {grid, beginY, columnWidth};
         s.target->PushAxisAlignedClip(rect(grid), D2D1_ANTIALIAS_MODE_ALIASED);
         for (size_t col = 0; col < columns_.size(); ++col) {
             auto& column = columns_[col];
             const double x = beginX + col * columnWidth - scrollX_;
             if (x + columnWidth <= grid.l || x >= grid.r) continue;
-            const Box title{x + 8, toolbar + 3, x + columnWidth - 75, toolbar + 34};
+            const Box heading{x, toolbar, x + columnWidth, beginY};
+            if (drag_.mode == Gesture::ColumnDrag && drag_.moved && drag_.reorder->a == col)
+                fill(s, heading, color.selected);
+            const Box title{x + 25, toolbar + 3, x + columnWidth - 75, toolbar + 34};
             const auto name = column.path.filename().empty() ? column.path.wstring() : column.path.filename().wstring();
+            for (int i = 0; i < 3; ++i) {
+                const double y = toolbar + 20 + i * 4;
+                fill(s, {x + 10, y, x + 12, y + 2}, color.muted, 1);
+                fill(s, {x + 15, y, x + 17, y + 2}, color.muted, 1);
+            }
             label(s, name, title, 15, color.fg, DWRITE_TEXT_ALIGNMENT_LEADING, true);
-            label(s, std::to_wstring(column.files.size()) + L" 张图片", {x + 8, toolbar + 30, x + columnWidth - 72, beginY - 3},
+            label(s, std::to_wstring(column.files.size()) + L" 张图片" + (column.manualOrder ? L" · 手动排序" : L""),
+                {title.l, toolbar + 30, title.r, beginY - 3},
                 12, color.muted);
-            s.hits.push_back({{(std::max)(title.l, grid.l), title.t, (std::min)(title.r, grid.r), title.b},
+            s.hits.push_back({{(std::max)(heading.l, grid.l), heading.t, (std::min)(heading.r, grid.r), heading.b},
                 Command::ColumnPath, col, 0, column.path.wstring()});
             button(s, {x + columnWidth - 72, toolbar + 17, x + columnWidth - 35, toolbar + 43}, L"全选", Command::ColumnSelect,
                 0, col, 0, L"选中这一列的全部图片");
@@ -1054,7 +1111,9 @@ void App::drawBrowser(Surface& s) {
                 const Box art{card.l + 4, card.t + 4, card.l + 64, card.b - 4};
                 const bool selected = selection_.contains(entry.path);
                 const bool hovered = card.contains(s.mouse);
-                fill(s, card, selected ? color.selected : hovered ? color.surface : color.panel, 6);
+                const bool dragging = drag_.mode == Gesture::FileDrag && drag_.moved &&
+                    drag_.reorder->a == col && drag_.reorder->b == row;
+                fill(s, card, selected || dragging ? color.selected : hovered ? color.surface : color.panel, 6);
                 fill(s, art, color.canvas, 4);
                 if (entry.thumb) fitBitmap(s, entry.thumb, inset(art, 2));
                 else label(s, entry.broken ? L"无法解码" : L"载入中…", art, 10,
@@ -1076,6 +1135,7 @@ void App::drawBrowser(Surface& s) {
             }
             s.target->PopAxisAlignedClip();
         }
+        if (const auto drop = reorderDrop(s, s.mouse)) fill(s, drop->indicator, color.blue, 1);
         s.target->PopAxisAlignedClip();
         for (auto& hit : s.hits) {
             if (hit.action != Command::ColumnSelect && hit.action != Command::ColumnClose) continue;
@@ -1112,7 +1172,7 @@ void App::drawBrowser(Surface& s) {
     const double start = treeVisible_ ? 18 : 103;
     label(s, L"已选 " + std::to_wstring(selection_.size()) + L" 张", {start, lower + 1, start + 117, s.height},
         14, color.fg, DWRITE_TEXT_ALIGNMENT_LEADING, true);
-    label(s, status_.empty() ? L"Ctrl 多选   ·   点击行号或列全选" : status_,
+    label(s, status_.empty() ? L"Ctrl 多选   ·   拖列标题左右换位   ·   拖图片行上下排序" : status_,
         {start + 118, lower + 1, s.width - 166, s.height}, 12, status_.empty() ? color.muted : color.amber);
     button(s, {s.width - 153, lower + 9, s.width - 16, lower + 45}, L"对比   空格", Command::Compare, 1);
 }
@@ -1138,7 +1198,6 @@ View App::view(const Surface& s, const Pane& pane, size_t imageSlot) const {
 }
 
 void App::drawHistogram(Surface& s, const Image& image, Box b) {
-    fill(s, b, color.overlay, 6);
     b = inset(b, 5);
     uint64_t maxCount{};
     for (const auto& channel : image.histogram)
@@ -1184,8 +1243,8 @@ void App::drawPane(Surface& s, const Pane& pane) {
             outline(s, rim, D2D1::ColorF(0x0c1016, .9f), 0, 3);
             outline(s, rim, ink, 0, 1.2f);
             if (info_ && !draft) {
-                fill(s, {rim.l, rim.t - 19, rim.l + 33, rim.t}, color.overlay, 3);
-                label(s, L"ROI", {rim.l + 4, rim.t - 19, rim.l + 32, rim.t}, 11, ink);
+                label(s, L"ROI", {rim.l + 4, rim.t - 19, rim.l + 32, rim.t}, 11, ink,
+                    DWRITE_TEXT_ALIGNMENT_LEADING, false, false, true);
             }
         };
         const bool editing = roiPreview_ && (!drag_.singleRoi || source == visibleSlot(drag_.slot));
@@ -1212,8 +1271,8 @@ void App::drawPane(Surface& s, const Pane& pane) {
                         reading += shown.image->gray ? L"Y " + n(p->r) : L"RGB " + n(p->r) + L" / " + n(p->g) + L" / " + n(p->b);
                     }
                     const Box box{area.l + 7, area.t + 35, (std::min)(area.r - 7, area.l + 240), area.t + 58};
-                    fill(s, box, color.overlay, 4);
-                    label(s, reading, inset(box, 4), 11, color.blue);
+                    label(s, reading, inset(box, 4), 11, color.blue, DWRITE_TEXT_ALIGNMENT_LEADING,
+                        false, false, true);
                 }
             }
         }
@@ -1226,9 +1285,9 @@ void App::drawPane(Surface& s, const Pane& pane) {
 
         if (showStats) {
             const Box stats{area.l + 7, area.b - 112, (std::min)(area.r - 7, area.l + 255), area.b - 7};
-            fill(s, stats, color.overlay, 6);
             if (!shown.measurement) {
-                label(s, L"正在统计 ROI…", inset(stats, 7), 12, color.muted);
+                label(s, L"正在统计 ROI…", inset(stats, 7), 12, color.fg, DWRITE_TEXT_ALIGNMENT_LEADING,
+                    false, false, true);
             } else {
                 const auto& m = *shown.measurement;
                 const auto tuple = [](const std::array<double, 3>& a) {
@@ -1241,20 +1300,18 @@ void App::drawPane(Surface& s, const Pane& pane) {
                     L"   n=" + std::to_wstring(m.count) + L"\n" +
                     (m.count ? L"RGB   " + tuple(m.rgb) + L"\nLab    " + tuple(m.lab) + L"\nHSV   " + hsv +
                         L"\n空域 σY   " + (m.count > 1 ? fixed(m.sigma, 3) + L" DN" : L"—") : L"框内无有效像素");
-                label(s, text, inset(stats, 7), 12, color.fg, DWRITE_TEXT_ALIGNMENT_LEADING, false, true);
+                label(s, text, inset(stats, 7), 12, color.fg, DWRITE_TEXT_ALIGNMENT_LEADING, false, true, true);
             }
         }
         if (info_) {
             const Box scale{area.r - 84, area.t + 6, area.r - 7, area.t + 30};
-            fill(s, scale, color.overlay, 5);
             label(s, fixed(layout.scale * s.dpi * 100, layout.scale * s.dpi < 1 ? 1 : 0) + L"%",
-                scale, 12, color.blue, DWRITE_TEXT_ALIGNMENT_CENTER);
+                scale, 12, color.blue, DWRITE_TEXT_ALIGNMENT_CENTER, false, false, true);
         }
     }
     if (info_) {
         const bool delta = diffOn_ && pane.slot == 1;
         const Box name{area.l + 7, area.t + 6, (std::max)(area.l + 8, area.r - 88), area.t + 30};
-        fill(s, name, color.overlay, 5);
         std::wstring title = displayPath(shown.path);
         if (overlay) title = L"覆盖 · " + title;
         if (delta) title = L"差值 ×" + fixed(gain_, 2) + L" · " + title;
@@ -1262,7 +1319,7 @@ void App::drawPane(Surface& s, const Pane& pane) {
             title += L"   " + std::to_wstring(shown.image->w) + L"×" + std::to_wstring(shown.image->h) +
                 L" · " + std::to_wstring(shown.image->bits) + L" bit";
         label(s, title, {name.l + 6, name.t, name.r - 4, name.b}, 12,
-            overlay || delta ? color.amber : color.fg);
+            overlay || delta ? color.amber : color.fg, DWRITE_TEXT_ALIGNMENT_LEADING, false, false, true);
     }
     s.target->PopAxisAlignedClip();
     const double x = std::floor(area.r * s.dpi) / s.dpi - .5 / s.dpi;
@@ -1443,6 +1500,7 @@ void App::paint(Surface& s) {
     s.height = dim.height;
     s.hits.clear();
     s.panes.clear();
+    s.grid = {};
     s.target->BeginDraw();
     s.target->Clear(color.bg);
     if (comparing_) drawCompare(s);
@@ -1529,9 +1587,17 @@ void App::command(const Hit& hit, bool ctrl) {
     context_.reset();
     switch (action) {
     case Command::Add: pickFolder(); break;
-    case Command::SortName: byTime_ = false; for (auto& col : columns_) sort(col); break;
-    case Command::SortTime: byTime_ = true; for (auto& col : columns_) sort(col); break;
-    case Command::Order: descending_ = !descending_; for (auto& col : columns_) sort(col); break;
+    case Command::SortName:
+    case Command::SortTime:
+    case Command::Order:
+        if (action == Command::Order) descending_ = !descending_;
+        else byTime_ = action == Command::SortTime;
+        for (auto& col : columns_) {
+            col.manualOrder = false;
+            sort(col);
+        }
+        status_.clear();
+        break;
     case Command::Compare: modalWindow_ = main_.hwnd; beginCompare(); break;
     case Command::Back: back(); break;
     case Command::Previous: step(-1); break;
@@ -1650,9 +1716,30 @@ bool App::roiAt(const Surface& s, const Pane& pane, Point p, unsigned& edges) co
 }
 
 void App::clearDrag() {
+    if (drag_.reorder) KillTimer(drag_.hwnd, reorderScrollTimer);
     drag_ = {};
     roiPreview_.reset();
     if (GetCapture() == main_.hwnd || (second_.hwnd && GetCapture() == second_.hwnd)) ReleaseCapture();
+}
+
+std::optional<ReorderDrop> App::reorderDrop(const Surface& s, Point p) const {
+    const auto& grid = s.grid;
+    if (!drag_.moved || !drag_.reorder || !grid.area.contains(p)) return {};
+    const auto& origin = *drag_.reorder;
+    const double x = grid.area.l + origin.a * grid.columnWidth - scrollX_;
+    if (drag_.mode == Gesture::ColumnDrag) {
+        const double column = (p.x - grid.area.l + scrollX_) / grid.columnWidth;
+        const auto boundary = (std::min)(columns_.size(), size_t(std::round(column)));
+        const double edge = std::clamp(grid.area.l + boundary * grid.columnWidth - scrollX_,
+            grid.area.l + 2, grid.area.r - 2);
+        return ReorderDrop{boundary, {edge - 1, grid.area.t + 3, edge + 1, grid.area.b}};
+    }
+    if (p.y < grid.bodyTop || p.x < x || p.x >= x + grid.columnWidth) return {};
+    const double row = (p.y - grid.bodyTop + scrollY_) / rowHeight;
+    const auto boundary = (std::min)(columns_[origin.a].files.size(), size_t(std::round(row)));
+    const double edge = std::clamp(grid.bodyTop + boundary * rowHeight - scrollY_,
+        grid.bodyTop + 1, grid.area.b - 1);
+    return ReorderDrop{boundary, {x + 8, edge - 1, x + grid.columnWidth - 8, edge + 1}};
 }
 
 void App::beginPointer(Surface& s, Point p, UINT message, WPARAM keys) {
@@ -1667,6 +1754,16 @@ void App::beginPointer(Surface& s, Point p, UINT message, WPARAM keys) {
         for (auto it = s.hits.rbegin(); it != s.hits.rend(); ++it) {
             if (!it->box.contains(p)) continue;
             const Hit hit = *it;
+            if (hit.action == Command::ColumnPath || hit.action == Command::FileSelect) {
+                drag_.mode = hit.action == Command::ColumnPath ? Gesture::ColumnDrag : Gesture::FileDrag;
+                drag_.hwnd = s.hwnd;
+                drag_.start = p;
+                drag_.reorder = hit;
+                drag_.ctrl = ctrl;
+                SetCapture(s.hwnd);
+                invalidate();
+                return;
+            }
             if (hit.action == Command::TreeOpen) {
                 drag_.mode = Gesture::TreeDrag;
                 drag_.hwnd = s.hwnd;
@@ -1751,6 +1848,13 @@ void App::movePointer(Surface& s, Point p) {
     tooltipReady_ = false;
     KillTimer(s.hwnd, 2);
     SetTimer(s.hwnd, 2, 640, nullptr);
+    if (drag_.reorder && !drag_.moved && drag_.hwnd == s.hwnd) {
+        const auto delta = p - drag_.start;
+        if (std::hypot(delta.x, delta.y) >= 6) {
+            drag_.moved = true;
+            SetTimer(s.hwnd, reorderScrollTimer, 40, nullptr);
+        }
+    }
     if (modal_ != Modal::None || !comparing_ || drag_.mode == Gesture::TreeDrag) {
         invalidate();
         return;
@@ -1813,6 +1917,27 @@ void App::movePointer(Surface& s, Point p) {
 
 void App::endPointer(Surface& s, Point p) {
     if (drag_.hwnd != s.hwnd) return;
+    if (drag_.reorder) {
+        movePointer(s, p);
+        const auto hit = *drag_.reorder;
+        const bool ctrl = drag_.ctrl, moved = drag_.moved;
+        const auto drop = reorderDrop(s, p);
+        clearDrag();
+        if (!moved && hit.box.contains(p)) command(hit, ctrl);
+        if (drop) {
+            if (hit.action == Command::ColumnPath) {
+                if (moveBefore(columns_, hit.a, drop->boundary)) status(L"已调整文件夹列顺序。");
+            } else {
+                auto& col = columns_[hit.a];
+                if (moveBefore(col.files, hit.b, drop->boundary)) {
+                    col.manualOrder = true;
+                    status(L"已调整图片顺序，对比翻页将按此顺序进行。");
+                }
+            }
+        }
+        invalidate();
+        return;
+    }
     if (drag_.mode == Gesture::TreeDrag) {
         const auto folder = drag_.folder;
         const auto delta = p - drag_.start;
@@ -1897,7 +2022,13 @@ void App::key(Surface& s, WPARAM code, LPARAM modifiers, bool down) {
         if (k == VK_ESCAPE) { context_.reset(); invalidate(); }
         return;
     }
-    if (drag_.mode != Gesture::None && k != L'S') return;
+    if (drag_.mode != Gesture::None && k != L'S') {
+        if (k == VK_ESCAPE && drag_.reorder) {
+            clearDrag();
+            invalidate();
+        }
+        return;
+    }
     if ((modifiers & (1ll << 30)) && k != VK_TAB) return;
     const auto action = [&](Command c) { command({{}, c, 0, 0, {}}); };
     if (k == L'K') { modalWindow_ = s.hwnd; action(Command::Help); return; }
@@ -2006,6 +2137,22 @@ LRESULT App::message(Surface& s, HWND hwnd, UINT message, WPARAM w, LPARAM l) {
     case WM_TIMER:
         if (w == 1) { KillTimer(hwnd, 1); status_.clear(); }
         if (w == 2) { KillTimer(hwnd, 2); tooltipReady_ = true; }
+        if (w == reorderScrollTimer) {
+            const auto& grid = s.grid;
+            const auto p = s.mouse;
+            if (!reorderDrop(s, p)) return 0;
+            if (drag_.mode == Gesture::ColumnDrag) {
+                if (p.x < grid.area.l + 24) scrollX_ -= 20;
+                else if (p.x >= grid.area.r - 24) scrollX_ += 20;
+                else return 0;
+            } else {
+                if (p.y < grid.bodyTop + 24) scrollY_ -= 18;
+                else if (p.y >= grid.area.b - 24) scrollY_ += 18;
+                else return 0;
+            }
+            scrollX_ = (std::max)(0., scrollX_);
+            scrollY_ = (std::max)(0., scrollY_);
+        }
         invalidate();
         return 0;
     case WM_LBUTTONDOWN: case WM_RBUTTONDOWN:
@@ -2036,6 +2183,10 @@ LRESULT App::message(Surface& s, HWND hwnd, UINT message, WPARAM w, LPARAM l) {
         TrackMouseEvent(&track);
         movePointer(s, pointer());
         if (drag_.mode == Gesture::TreeDrag) SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+        else if (drag_.reorder && drag_.moved) {
+            const auto cursor = drag_.mode == Gesture::ColumnDrag ? IDC_SIZEWE : IDC_SIZENS;
+            SetCursor(LoadCursor(nullptr, reorderDrop(s, s.mouse) ? cursor : IDC_NO));
+        }
         else if (comparing_ && sHeld_) SetCursor(LoadCursor(nullptr, IDC_CROSS));
         else SetCursor(LoadCursor(nullptr, IDC_ARROW));
         return 0;
@@ -2054,7 +2205,12 @@ LRESULT App::message(Surface& s, HWND hwnd, UINT message, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_CAPTURECHANGED:
-        if (drag_.hwnd == hwnd) { drag_ = {}; roiPreview_.reset(); invalidate(); }
+        if (drag_.hwnd == hwnd) {
+            if (drag_.reorder) KillTimer(hwnd, reorderScrollTimer);
+            drag_ = {};
+            roiPreview_.reset();
+            invalidate();
+        }
         return 0;
     case WM_KEYDOWN: case WM_KEYUP:
         key(s, w, l, message == WM_KEYDOWN); return 0;
@@ -2068,7 +2224,7 @@ LRESULT App::message(Surface& s, HWND hwnd, UINT message, WPARAM w, LPARAM l) {
         return 0;
     case WM_DROPFILES: {
         auto drop = reinterpret_cast<HDROP>(w);
-        if (!comparing_ && modal_ == Modal::None) {
+        if (!comparing_ && modal_ == Modal::None && !drag_.reorder) {
             UINT added{};
             const UINT count = DragQueryFileW(drop, 0xffffffff, nullptr, 0);
             for (UINT i = 0; i < count; ++i) {

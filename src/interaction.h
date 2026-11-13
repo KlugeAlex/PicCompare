@@ -52,4 +52,14 @@ inline Point zoomTranslation(Point current, Point anchor, double factor) {
     return current * factor + (anchor - Point{.5, .5}) * (1 - factor);
 }
 
+template<class T>
+bool moveBefore(std::vector<T>& items, size_t source, size_t boundary) {
+    if (source >= items.size() || boundary > items.size() ||
+        boundary == source || boundary == source + 1) return false;
+    const auto first = items.begin();
+    if (boundary < source) std::rotate(first + boundary, first + source, first + source + 1);
+    else std::rotate(first + source, first + source + 1, first + boundary);
+    return true;
+}
+
 } // namespace pic

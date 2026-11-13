@@ -15,6 +15,11 @@ bool close(double a, double b, double epsilon = 1e-7) {
     return std::abs(a - b) < epsilon;
 }
 void checkInteraction() {
+    std::vector<int> order{1, 2, 3, 4};
+    require(moveBefore(order, 0, 4) && order == std::vector<int>{2, 3, 4, 1}, "reorder forward to end");
+    require(moveBefore(order, 2, 0) && order == std::vector<int>{4, 2, 3, 1}, "reorder backward to beginning");
+    require(!moveBefore(order, 1, 2) && !moveBefore(order, 1, 5) && !moveBefore(order, 4, 0),
+        "reorder no-op and invalid boundaries");
     const auto sameBox = [](Box a, Box b) {
         return close(a.l, b.l) && close(a.t, b.t) && close(a.r, b.r) && close(a.b, b.b);
     };
